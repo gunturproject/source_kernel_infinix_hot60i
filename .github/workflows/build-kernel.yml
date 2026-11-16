@@ -1,12 +1,12 @@
-name: Build Kernel · SempakJemboat (KernelSU-Next + AnyKernel3)
+name: Build Kernel · SempakJemboat (KernelSU-Next + SuSFS 2.4.0 + CVE)
 
 on:
   workflow_dispatch:
     inputs:
       ksu_ref:
-        description: "KernelSU-Next ref (tag/branch). Kosong = tag terbaru"
+        description: "KernelSU-Next ref (default dev-susfs = varian dengan dukungan SUSFS in-kernel)"
         required: false
-        default: ""
+        default: "dev-susfs"
   push:
     branches: [main]
     paths:
@@ -22,12 +22,17 @@ concurrency:
 
 jobs:
   build:
-    name: GKI 6.6 + KernelSU-Next
+    name: GKI 6.6 + KernelSU-Next + SuSFS
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:
       ARCH: arm64
       KSU_REF: ${{ inputs.ksu_ref }}
+      KSU_REPO: "https://github.com/pershoot/KernelSU-Next.git"
+      SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
+      SUSFS_BRANCH: "gki-android15-6.6"
+      # f98f08223b = "kernel & KernelSU: Sync with upstream", SUSFS_VERSION tetap v2.4.0
+      SUSFS_COMMIT: "f98f08223bbf469cc0a1542166383d253557fc32"
       CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android15-release/clang-r510928.tar.gz"
       KBUILD_BUILD_USER: gunturproject
       KBUILD_BUILD_HOST: SempakJemboat-CI
@@ -106,22 +111,153 @@ jobs:
           "$RUNNER_TEMP/toolchain/bin/clang" --version
           "$RUNNER_TEMP/toolchain/bin/ld.lld" --version
 
-      - name: Integrate KernelSU-Next
+      - name: Apply CVE fixes (GhostLock + DirtyFrag)
         run: |
-          set -e
-          SETUP="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
-          if [ -n "$KSU_REF" ]; then
-            echo ">> KernelSU-Next ref: $KSU_REF"
-            curl -LSs "$SETUP" | bash -s "$KSU_REF"
-          else
-            echo ">> KernelSU-Next: tag terbaru"
-            curl -LSs "$SETUP" | bash
-          fi
-          echo "--- symlink ---"
-          ls -l drivers/kernelsu
-          grep -n "kernelsu" drivers/Makefile drivers/Kconfig
+          set -euo pipefail
 
-      - name: Configure kernel (gki_defconfig + KSU)
+          # Coba tiap SHA berurutan; pakai yang benar-benar cocok. Gagal = job gagal.
+          apply_one() {
+            local name="$1"; shift
+            local sha url p
+            for sha in "$@"; do
+              p="$RUNNER_TEMP/cve-$sha.patch"
+              url="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/patch/?id=$sha"
+              if ! curl -fsSL --retry 3 --retry-delay 3 -m 90 -o "$p" "$url"; then
+                echo "[-] $name: gagal unduh $sha"
+                continue
+              fi
+              if git apply --check -p1 "$p" 2>/dev/null; then
+                git apply -p1 "$p"
+                echo "[OK] $name <- $sha (git apply)"
+                return 0
+              fi
+              if patch -p1 -F3 --dry-run --forward < "$p" >/dev/null 2>&1; then
+                patch -p1 -F3 --forward --no-backup-if-mismatch < "$p"
+                echo "[OK] $name <- $sha (patch -F3)"
+                return 0
+              fi
+              echo "[-] $name: $sha tidak cocok dengan 6.6.102"
+            done
+            echo "[GAGAL] $name: tidak ada patch yang bisa diterapkan" >&2
+            return 1
+          }
+
+          # CVE-2026-43499 GhostLock: rtmutex remove_waiter() UAF (futex PI)
+          apply_one CVE-2026-43499 \
+            8a1fc8d698ac5e5916e3082a0f74450d71f9611f \
+            3bfdc63936dd4773109b7b8c280c0f3b5ae7d349
+
+          # CVE-2026-43284 DirtyFrag: ESP in-place decrypt di frag sharing
+          apply_one CVE-2026-43284 \
+            50ed1e7873100f77abad20fd31c51029bc49cd03 \
+            f4c50a4034e62ab75f1d5cdd191dd5f9c77fdff4
+
+          # CVE-2026-46300: SKBFL_SHARED_FRAG hilang saat coalescing
+          apply_one CVE-2026-46300 \
+            78bf6b6bb19541d19fbda6242e7cfe2c682763c0 \
+            f84eca5817390257cef78013d0112481c503b4a3
+
+          # Keluarga DirtyFrag: propagasi marker shared-frag di helper transfer frag
+          apply_one DirtyFrag-skbuff-helpers \
+            989214c66884d70716d83dc1d0bf5e16287bf349 \
+            48f6a5356a33dd78e7144ae1faef95ffc990aae0
+
+          # CVE-2026-43500 (rxrpc): kode rentan (rxrpc_verify_response / gate skb_cloned)
+          # baru ada di 6.6.y setelah 6.6.102, jadi kalau tidak apply cukup warning.
+          if apply_one CVE-2026-43500 \
+               3711382a77342a9a1c3d2e7330dcfc7ea927f568 \
+               aa54b1d27fe0c2b78e664a34fd0fdf7cd1960d71; then
+            echo "[OK] CVE-2026-43500 diterapkan"
+          else
+            echo "::warning::CVE-2026-43500 tidak dapat diterapkan pada 6.6.102: fungsi rentan rxrpc_verify_response() belum ada di source ini, vektor rxrpc tidak aktif."
+          fi
+
+          # tidak boleh ada reject
+          if find . -name '*.rej' | grep -q .; then
+            echo "[GAGAL] ada hunk yang ditolak:"; find . -name '*.rej'
+            exit 1
+          fi
+
+          echo "=== verifikasi patch CVE ==="
+          grep -q 'skb_has_shared_frag(skb)' net/ipv4/esp4.c
+          grep -q 'skb_has_shared_frag(skb)' net/ipv6/esp6.c
+          grep -q 'from_shinfo->flags & SKBFL_SHARED_FRAG' net/core/skbuff.c
+          grep -q 'waiter_task->pi_blocked_on = NULL' kernel/locking/rtmutex.c
+          echo "semua marker patch CVE terverifikasi"
+
+      - name: Integrate SuSFS v2.4.0
+        run: |
+          set -euo pipefail
+          retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 5 ] && return 1; sleep 5; done; }
+
+          retry git clone --branch "$SUSFS_BRANCH" "$SUSFS_REPO" susfs4ksu
+          cd susfs4ksu
+          git checkout "$SUSFS_COMMIT"
+          echo "SuSFS commit: $(git rev-parse HEAD)"
+
+          # Dua fix pershoot: susfs inti harus bisa hidup bersama toolkit SUSFS KernelSU-Next.
+          # Kalau sudah ada (reverse-apply bersih) -> skip; kalau konflik -> gagal.
+          for sha in 6387756d64b3ab9ececefc4523627a9ee05a7519 \
+                     161c058fed5544a6573d87124f346dadd5c4962d; do
+            p="$RUNNER_TEMP/susfs-$sha.patch"
+            retry curl -fsSL -m 90 -o "$p" \
+              "https://gitlab.com/pershoot/susfs4ksu/-/commit/$sha.patch"
+            if git apply --check "$p" 2>/dev/null; then
+              git apply "$p"; echo "[OK] fix pershoot $sha"
+            elif git apply --reverse --check "$p" 2>/dev/null; then
+              echo "[SKIP] fix pershoot $sha sudah ada"
+            else
+              echo "[GAGAL] fix pershoot $sha tidak bisa diterapkan" >&2
+              exit 1
+            fi
+          done
+
+          cd ..
+          grep -n 'SUSFS_VERSION' susfs4ksu/kernel_patches/include/linux/susfs.h
+          grep -q 'SUSFS_VERSION "v2.4.0"' susfs4ksu/kernel_patches/include/linux/susfs.h
+
+          cp susfs4ksu/kernel_patches/fs/susfs.c fs/
+          cp susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+          cp susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
+
+          patch -p1 -F3 --forward --no-backup-if-mismatch \
+            < susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch
+
+          if find . -name '*.rej' | grep -q .; then
+            echo "[GAGAL] patch SuSFS ditolak:"; find . -name '*.rej'
+            exit 1
+          fi
+
+          # wajib untuk GKI android14+: kalau tidak dihapus, modul WiFi bisa rusak
+          rm -f android/abi_gki_protected_exports_*
+
+          echo "=== verifikasi SuSFS ==="
+          grep -q 'susfs' fs/Makefile
+          grep -q 'SUSFS_VERSION "v2.4.0"' include/linux/susfs.h
+          grep -q 'susfs_is_current_ksu_domain' include/linux/susfs.h
+          echo "SuSFS v2.4.0 terpasang di kernel"
+
+      - name: Integrate KernelSU-Next (SUSFS-capable)
+        run: |
+          set -euo pipefail
+          retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 5 ] && return 1; sleep 5; done; }
+
+          REF="${KSU_REF:-dev-susfs}"
+          retry git clone --depth 1 --branch "$REF" "$KSU_REPO" KernelSU
+          echo "KernelSU-Next: $(git -C KernelSU log -1 --format='%H %ad %s' --date=short)"
+
+          # bukti varian ini benar-benar punya dukungan SUSFS in-kernel
+          grep -q 'config KSU_SUSFS' KernelSU/kernel/Kconfig
+
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          grep -q kernelsu drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          ls -l drivers/kernelsu
+          grep -n 'kernelsu' drivers/Makefile drivers/Kconfig
+
+      - name: Configure kernel (gki_defconfig + KSU + SuSFS)
         run: |
           set -e
           make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 gki_defconfig
@@ -129,6 +265,17 @@ jobs:
           # integrasi root + percepat build
           scripts/config --file out/.config \
             --enable KSU \
+            --enable KSU_SUSFS \
+            --enable KSU_SUSFS_SUS_PATH \
+            --enable KSU_SUSFS_SUS_MOUNT \
+            --enable KSU_SUSFS_SUS_KSTAT \
+            --enable KSU_SUSFS_SPOOF_UNAME \
+            --enable KSU_SUSFS_ENABLE_LOG \
+            --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            --enable KSU_SUSFS_OPEN_REDIRECT \
+            --enable KSU_SUSFS_SUS_MAP \
+            --enable KSU_SUSFS_PRIORITY_UID_FILTER \
             --disable KASAN \
             --disable KASAN_HW_TAGS \
             --disable DEBUG_INFO \
@@ -144,7 +291,7 @@ jobs:
           make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 olddefconfig
 
           echo "=== config penting ==="
-          grep -E "CONFIG_(KSU|KPROBES|EXT4_FS|KASAN|CFI_CLANG|LTO|LOCALVERSION|MODULES)=" out/.config || true
+          grep -E "CONFIG_(KSU|KSU_SUSFS|KPROBES|EXT4_FS|KASAN|CFI_CLANG|LTO|LOCALVERSION|MODULES)=" out/.config || true
 
       - name: Build Image
         run: |
@@ -169,7 +316,7 @@ jobs:
           ### AnyKernel setup
           # global properties
           properties() { '
-          kernel.string=SempakJemboat Kernel (GKI 6.6.102) + KernelSU-Next by gunturproject
+          kernel.string=SempakJemboat Kernel (GKI 6.6.102) + KernelSU-Next + SuSFS 2.4.0
           do.devicecheck=0
           do.modules=0
           do.systemless=0
@@ -211,6 +358,12 @@ jobs:
           ls -lh "$ZIP"
           sha256sum "$ZIP"
 
+          # modul userspace ksu_susfs v2.4.0 (opsional, untuk mengatur hide)
+          if [ -d susfs4ksu/ksu_module_susfs ]; then
+            ( cd susfs4ksu/ksu_module_susfs && zip -r9 "../../SUSFS-v2.4.0-ksu-module.zip" . )
+            ls -lh SUSFS-v2.4.0-ksu-module.zip
+          fi
+
       - name: Fetch KernelSU-Next manager APK
         run: |
           URL=$(curl -s https://api.github.com/repos/KernelSU-Next/KernelSU-Next/releases/latest \
@@ -228,6 +381,7 @@ jobs:
           name: SempakJemboat-kernel-${{ github.run_number }}
           path: |
             SempakJemboat-Kernel-*.zip
+            SUSFS-v2.4.0-ksu-module.zip
             out/arch/arm64/boot/Image
             KernelSU-Next-manager.apk
             build.log
@@ -239,7 +393,8 @@ jobs:
         run: |
           FILES="SempakJemboat-Kernel-${GITHUB_RUN_NUMBER}.zip"
           [ -f KernelSU-Next-manager.apk ] && FILES="$FILES KernelSU-Next-manager.apk"
+          [ -f SUSFS-v2.4.0-ksu-module.zip ] && FILES="$FILES SUSFS-v2.4.0-ksu-module.zip"
           gh release create "build-${GITHUB_RUN_NUMBER}" $FILES \
             --title "SempakJemboat build ${GITHUB_RUN_NUMBER}" \
-            --notes "Kernel GKI 6.6.102 (android15-6.6) + KernelSU-Next, dikemas dengan AnyKernel3. Commit: ${GITHUB_SHA}" \
+            --notes "Kernel GKI 6.6.102 (android15-6.6) + KernelSU-Next (dev-susfs) + SuSFS v2.4.0, dikemas dengan AnyKernel3. Fix: CVE-2026-43499 (GhostLock), CVE-2026-43284 / CVE-2026-46300 (DirtyFrag). Commit: ${GITHUB_SHA}" \
             || echo "release gagal (mungkin sudah ada), lanjut"
