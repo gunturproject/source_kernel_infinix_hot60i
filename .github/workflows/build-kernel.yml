@@ -232,9 +232,13 @@ jobs:
           rm -f android/abi_gki_protected_exports_*
 
           echo "=== verifikasi SuSFS ==="
-          grep -q 'susfs' fs/Makefile
+          grep -q 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
           grep -q 'SUSFS_VERSION "v2.4.0"' include/linux/susfs.h
-          grep -q 'susfs_is_current_ksu_domain' include/linux/susfs.h
+          grep -q 'susfs_set_priority_uid_filter' include/linux/susfs.h
+          test -s fs/susfs.c
+          test -s include/linux/susfs_def.h
+          # hunk yang kena fuzz saat apply: pastikan masuk ke fungsi yang benar
+          awk '/^static int show_smap\(/,/^}/' fs/proc/task_mmu.c | grep -q 'SUSFS_IS_INODE_SUS_MAP'
           echo "SuSFS v2.4.0 terpasang di kernel"
 
       - name: Integrate KernelSU-Next (SUSFS-capable)
