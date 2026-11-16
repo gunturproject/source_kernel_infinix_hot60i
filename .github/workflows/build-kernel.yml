@@ -45,6 +45,50 @@ jobs:
           echo "commit: $(git rev-parse --short HEAD)"
           df -h / | tail -1
 
+      - name: Free disk space (super agresif)
+        run: |
+          echo "=== disk SEBELUM ==="; df -h /
+          # toolchain/SDK bawaan image yang tidak dipakai build kernel
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /usr/local/lib/android/sdk \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/lib/jvm \
+            /opt/microsoft \
+            /usr/share/miniconda \
+            /usr/local/.ghcup 2>/dev/null || true
+          # docker & containerd
+          sudo systemctl stop docker.socket docker containerd 2>/dev/null || true
+          sudo rm -rf /var/lib/docker /var/lib/containerd /var/lib/docker/* 2>/dev/null || true
+          # cache paket
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
+          # log
+          sudo rm -rf /var/log/*.log /var/log/journal/* 2>/dev/null || true
+          sync
+          echo "=== disk SESUDAH ==="; df -h /
+
+      - name: Setup swap 16 GB
+        run: |
+          echo "=== memori SEBELUM ==="; free -h
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          # fallocate, fallback dd kalau filesystem tidak mendukung
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=progress
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon --priority 100 /swapfile
+          # tuning agresif: pakai swap lebih cepat, kurangi cache agresif
+          sudo sysctl -w vm.swappiness=180
+          sudo sysctl -w vm.vfs_cache_pressure=200 || true
+          sudo sysctl -w vm.dirty_ratio=10 || true
+          echo "=== swap aktif ==="; swapon --show; free -h; df -h /
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
