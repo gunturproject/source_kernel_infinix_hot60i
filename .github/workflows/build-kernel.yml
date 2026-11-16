@@ -1,0 +1,201 @@
+name: Build Kernel · SempakJemboat (KernelSU-Next + AnyKernel3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: "KernelSU-Next ref (tag/branch). Kosong = tag terbaru"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-kernel.yml"
+      - "arch/arm64/configs/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kernel-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: GKI 6.6 + KernelSU-Next
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      ARCH: arm64
+      KSU_REF: ${{ inputs.ksu_ref }}
+      CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android15-release/clang-r510928.tar.gz"
+      KBUILD_BUILD_USER: gunturproject
+      KBUILD_BUILD_HOST: SempakJemboat-CI
+      KBUILD_BUILD_VERSION: ${{ github.run_number }}
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Source info
+        run: |
+          head -5 Makefile
+          echo "commit: $(git rev-parse --short HEAD)"
+          df -h / | tail -1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev openssl \
+            kmod cpio rsync zip unzip xz-utils zstd lz4 \
+            device-tree-compiler python3 git curl ca-certificates jq
+
+      - name: Download AOSP clang r510928
+        run: |
+          mkdir -p "$RUNNER_TEMP/toolchain"
+          curl -fL --retry 3 --retry-delay 5 "$CLANG_URL" -o "$RUNNER_TEMP/clang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/toolchain"
+          echo "$RUNNER_TEMP/toolchain/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/toolchain/bin/clang" --version
+          "$RUNNER_TEMP/toolchain/bin/ld.lld" --version
+
+      - name: Integrate KernelSU-Next
+        run: |
+          set -e
+          SETUP="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+          if [ -n "$KSU_REF" ]; then
+            echo ">> KernelSU-Next ref: $KSU_REF"
+            curl -LSs "$SETUP" | bash -s "$KSU_REF"
+          else
+            echo ">> KernelSU-Next: tag terbaru"
+            curl -LSs "$SETUP" | bash
+          fi
+          echo "--- symlink ---"
+          ls -l drivers/kernelsu
+          grep -n "kernelsu" drivers/Makefile drivers/Kconfig
+
+      - name: Configure kernel (gki_defconfig + KSU)
+        run: |
+          set -e
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 gki_defconfig
+
+          # integrasi root + percepat build
+          scripts/config --file out/.config \
+            --enable KSU \
+            --disable KASAN \
+            --disable KASAN_HW_TAGS \
+            --disable DEBUG_INFO \
+            --disable DEBUG_INFO_DWARF5 \
+            --disable DEBUG_INFO_COMPRESSED_ZSTD \
+            --disable DEBUG_INFO_BTF \
+            --disable CFI_CLANG \
+            --disable LTO_CLANG_THIN \
+            --disable LTO_CLANG_FULL \
+            --disable WERROR \
+            --set-str LOCALVERSION "-SempakJemboat"
+
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 olddefconfig
+
+          echo "=== config penting ==="
+          grep -E "CONFIG_(KSU|KPROBES|EXT4_FS|KASAN|CFI_CLANG|LTO|LOCALVERSION|MODULES)=" out/.config || true
+
+      - name: Build Image
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 Image 2>&1 | tee build.log
+          ls -lh out/arch/arm64/boot/Image
+          sha256sum out/arch/arm64/boot/Image
+
+      - name: Package AnyKernel3
+        run: |
+          set -e
+          ZIP="SempakJemboat-Kernel-${GITHUB_RUN_NUMBER}.zip"
+
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git
+          cp out/arch/arm64/boot/Image ak3/Image
+
+          cat > ak3/anykernel.sh <<'AK3EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## SempakJemboat kernel @ gunturproject
+
+          ### AnyKernel setup
+          # global properties
+          properties() { '
+          kernel.string=SempakJemboat Kernel (GKI 6.6.102) + KernelSU-Next by gunturproject
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=
+          device.name2=
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          ### AnyKernel install
+          ## boot files attributes
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          } # end attributes
+
+          # boot shell variables
+          BLOCK=boot;
+          IS_SLOT_DEVICE=1;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # boot install
+          dump_boot;
+          write_boot;
+          AK3EOF
+
+          rm -f ak3/anykernel.sh.bak
+          ( cd ak3 && zip -r9 "../$ZIP" . -x 'README.md' '*placeholder' )
+          ls -lh "$ZIP"
+          sha256sum "$ZIP"
+
+      - name: Fetch KernelSU-Next manager APK
+        run: |
+          URL=$(curl -s https://api.github.com/repos/KernelSU-Next/KernelSU-Next/releases/latest \
+            | jq -r '.assets[]?.browser_download_url | select(endswith(".apk"))' | head -n1)
+          if [ -n "$URL" ]; then
+            curl -fL "$URL" -o KernelSU-Next-manager.apk
+            ls -lh KernelSU-Next-manager.apk
+          else
+            echo "APK tidak ditemukan, lewati"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SempakJemboat-kernel-${{ github.run_number }}
+          path: |
+            SempakJemboat-Kernel-*.zip
+            out/arch/arm64/boot/Image
+            KernelSU-Next-manager.apk
+            build.log
+          if-no-files-found: warn
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FILES="SempakJemboat-Kernel-${GITHUB_RUN_NUMBER}.zip"
+          [ -f KernelSU-Next-manager.apk ] && FILES="$FILES KernelSU-Next-manager.apk"
+          gh release create "build-${GITHUB_RUN_NUMBER}" $FILES \
+            --title "SempakJemboat build ${GITHUB_RUN_NUMBER}" \
+            --notes "Kernel GKI 6.6.102 (android15-6.6) + KernelSU-Next, dikemas dengan AnyKernel3. Commit: ${GITHUB_SHA}" \
+            || echo "release gagal (mungkin sudah ada), lanjut"
